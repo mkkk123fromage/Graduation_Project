@@ -1,0 +1,10 @@
+torch
+transformers==4.39.3
+open_clip_torch
+Pillow
+opencv-python<4.13
+scipy
+tqdm
+numpy==1.26.4
+safetensors
+huggingface_hub

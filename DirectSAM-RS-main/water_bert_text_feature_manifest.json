@@ -1,0 +1,33 @@
+{
+  "model": "bert-base-uncased",
+  "context_length": 20,
+  "prompts": {
+    "water": "water",
+    "all_waters": "Edge of all waters",
+    "river": "river",
+    "river_urban": "river, urban",
+    "river_farmland": "river, farmland",
+    "river_forest": "river, forest",
+    "river_grassland": "river, grassland",
+    "river_desert": "river, desert",
+    "lake": "lake",
+    "lake_urban": "lake, urban",
+    "lake_farmland": "lake, farmland",
+    "lake_forest": "lake, forest",
+    "lake_grassland": "lake, grassland",
+    "lake_desert": "lake, desert",
+    "pond": "pond",
+    "pond_urban": "pond, urban",
+    "pond_farmland": "pond, farmland",
+    "pond_forest": "pond, forest",
+    "pond_grassland": "pond, grassland",
+    "pond_desert": "pond, desert",
+    "reservoir": "reservoir",
+    "reservoir_urban": "reservoir, urban",
+    "reservoir_farmland": "reservoir, farmland",
+    "reservoir_forest": "reservoir, forest",
+    "reservoir_grassland": "reservoir, grassland",
+    "reservoir_desert": "reservoir, desert"
+  },
+  "note": "Token-level last_hidden_state features from BERT-base-uncased."
+}

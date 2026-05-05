@@ -1,0 +1,20 @@
+{
+  "water_types": {
+    "river": "river",
+    "lake": "lake",
+    "pond": "pond",
+    "reservoir": "reservoir"
+  },
+  "environments": {
+    "urban": "urban",
+    "farmland": "farmland",
+    "forest": "forest",
+    "grassland": "grassland",
+    "desert": "desert"
+  },
+  "template": "{water_type}, {environment}",
+  "aliases": {
+    "water": "water",
+    "all_waters": "Edge of all waters"
+  }
+}

@@ -1,0 +1,284 @@
+DirectSAM-RS 模型理解说明
+
+一句话概括：
+这是一个以 SegFormer 为视觉主干、以预计算文本 token 特征为语义提示、通过多层 cross-attention 做图文融合、最终输出单通道轮廓概率图的遥感语义轮廓提取模型。
+
+一、模型整体结构
+
+仓库里真正用的模型类是 SegformerWithTextFusion，定义在：
+C:\Users\22090\Desktop\DirectSAM-RS-main\DirectSAM-RS-main\model.py
+
+它继承了 HuggingFace 风格的分割模型，但把普通 SegFormer 编码器替换成了带文本融合的 SegformerMultiModel，而 SegformerMultiModel 内部再调用 SegformerMultiEncoder 做真正的图文联合编码。
+
+所以整体结构可以概括为：
+
+图像 -> SegFormer 4阶段编码 -> 每阶段后接文本 Cross-Attention -> 多尺度解码头 -> 单通道轮廓 logits -> sigmoid -> 轮廓概率图
+
+二、视觉主干是什么
+
+视觉主干本质上就是 SegFormer / MiT。前半部分大段代码基本是 HuggingFace 版 SegFormer，包括：
+
+1. SegformerOverlapPatchEmbeddings：把图像切成重叠 patch 并嵌入
+2. SegformerLayer：每层是高效自注意力 + MixFFN
+3. SegformerEncoder 那套层级式结构
+
+模型配置在：
+C:\Users\22090\Desktop\DirectSAM-RS-main\DirectSAM-RS-main\weight\config.json
+
+关键参数如下：
+
+depths = [3, 6, 40, 3]
+hidden_sizes = [64, 128, 320, 512]
+num_attention_heads = [1, 2, 5, 8]
+patch_sizes = [7, 3, 3, 3]
+strides = [4, 2, 2, 2]
+decoder_hidden_size = 768
+
+这组参数说明视觉 backbone 是比较重的一个 SegFormer 变体。
+
+三、文本分支怎么来的
+
+这个仓库发布版里，文本不是在线编码的，而是离线预编码后直接存进了 text_feature.pth。
+
+推理脚本在：
+C:\Users\22090\Desktop\DirectSAM-RS-main\DirectSAM-RS-main\infer.py
+
+里面会直接：
+
+1. 读 text_feature.pth
+2. 取某个 prompt 对应的 xxx_feature
+3. 取对应的 xxx_mask
+
+比如默认示例就是：
+
+forest_feature
+forest_mask
+
+我检查了 text_feature.pth，其中每个类别大致都是：
+
+feature: [1, 20, 768]
+mask: [1, 20]
+
+也就是说：
+
+1. 最多保留 20 个 token
+2. 每个 token 是 768 维文本特征
+3. mask 表示哪些 token 有效
+
+仓库虽然 import 了 open_clip，但当前代码里没有在线调用文本编码器。说明作者训练或发布时应该用 CLIP 类模型把 prompt 编好了，然后推理时直接加载。
+
+四、图文融合是怎么做的
+
+这是这份代码最关键的地方，在：
+C:\Users\22090\Desktop\DirectSAM-RS-main\DirectSAM-RS-main\model.py
+
+SegformerMultiEncoder 有 4 个视觉 stage，每个 stage 做完原始 SegFormer block 和 LayerNorm 后，都会插入一组 cross-attention：
+
+cross_merge_initial
+cross_merge_middle
+cross_merge_late
+cross_merge_final
+
+每组都由两个 CrossAttentionBlock 组成。
+
+它的逻辑是：
+
+query 来自视觉 token
+key/value 来自文本 token
+先把视觉特征和文本特征都投影到公共维度 512
+用 nn.MultiheadAttention 做 cross-attention
+再过一个前馈网络 FFN
+如果需要，就投影回该 stage 原来的通道维度
+
+这个设计的意义是：
+
+1. 图像特征不是单纯看“哪里像边缘”
+2. 而是在每一层都问一次：“哪些视觉位置和当前文本语义最相关？”
+3. 所以最后提取出来的是语义指定类别的轮廓，而不是 class-agnostic 边缘
+
+五、解码头怎么输出轮廓
+
+解码头在 model.py 里，基本是标准 SegFormer decode head：
+
+1. 每个 stage 的特征先过一个线性层，统一到 decoder_hidden_size = 768
+2. 全部上采样到同一空间分辨率
+3. 拼接
+4. 经过 1x1 conv + BN + ReLU + Dropout
+5. 最后 classifier 输出 num_labels 个通道
+
+而这个模型配置里只有一个类别，所以最终输出就是：
+
+logits: [B, 1, H/4, W/4]
+
+之后在推理时再插值回原图大小，再做 sigmoid，得到轮廓概率图。
+
+六、训练目标是什么
+
+SegformerWithTextFusion.forward() 里如果给了 labels，会在上采样回标签分辨率后算 loss。因为这里只有 1 个输出通道，所以走的是：
+
+BCEWithLogitsLoss
+
+也就是说，这不是多类语义分割训练，而是单通道二值轮廓预测训练：每个像素判断是不是目标语义的 contour。
+
+七、推理流程怎么走
+
+推理入口是：
+C:\Users\22090\Desktop\DirectSAM-RS-main\DirectSAM-RS-main\infer.py
+
+流程如下：
+
+1. 加载 AutoImageProcessor
+2. 加载 SegformerWithTextFusion.from_pretrained("./weight")
+3. 从 text_feature.pth 取一个 prompt 的 feature 和 mask
+4. 图像经过 process_one_image() 前向推理
+5. 输出概率图 probs
+6. 保存成 .npy
+7. 可选再做 NMS 后处理，生成更细的边界图
+
+这里的 NMS 还调用了 C++ 动态库 solve_csa.so，说明作者把边缘细化那部分做成了加速库。
+
+八、它和“原始 DirectSAM”相比到底改了什么
+
+按 README 的说法，这个工作是在 DirectSAM 思想上做遥感适配，但从代码落地看，关键创新更像是：
+
+1. 从“无文本、类无关边缘提取”变成“有文本提示、类别可控的语义轮廓提取”
+2. 引入文本 token 特征
+3. 在 4 个视觉 stage 都做 cross-attention 融合
+4. 训练目标变成目标类别 contour 的单通道预测
+5. 数据集也从自然图像边界迁移到遥感图像语义轮廓 triplet
+
+所以它的本质不是“给 DirectSAM 套个 prompt 外壳”，而是把语义提示真正注入到了视觉编码过程。
+
+九、最值得抓住的主线
+
+如果只记 4 个点，就记这 4 个：
+
+1. SegFormer 负责提取多尺度视觉特征。
+2. 文本 prompt 已经提前编码成 token 特征，推理时直接读取。
+3. 每个视觉 stage 后都用 cross-attention 把文本语义灌进视觉 token。
+4. 解码头输出的是单通道 contour 概率图，不是常规多类 mask。
+
+十、张量流动图
+
+可以把 DirectSAM-RS 看成这条链：
+
+输入图像 x: [B, 3, H, W]
+    ->
+SegFormer Stage 1: [B, 64, H/4,  W/4]
+    + 文本 cross-attention
+    ->
+SegFormer Stage 2: [B,128, H/8,  W/8]
+    + 文本 cross-attention
+    ->
+SegFormer Stage 3: [B,320, H/16, W/16]
+    + 文本 cross-attention
+    ->
+SegFormer Stage 4: [B,512, H/32, W/32]
+    + 文本 cross-attention
+    ->
+多尺度解码头
+    ->
+logits: [B, 1, H/4, W/4]
+    ->
+上采样回原图大小
+    ->
+sigmoid
+    ->
+轮廓概率图 probs: [H, W]
+    ->
+可选 NMS 后处理
+    ->
+更细的边界结果
+
+如果推理分辨率设成 1024，那 4 个视觉 stage 大致就是：
+
+Stage 1: [B, 64, 256, 256]
+Stage 2: [B, 128, 128, 128]
+Stage 3: [B, 320, 64, 64]
+Stage 4: [B, 512, 32, 32]
+
+文本输入不是在线编码，而是从 text_feature.pth 里直接读：
+
+feature: [1, 20, 768]
+mask: [1, 20]
+
+也就是“最多 20 个 token，每个 token 768 维”。
+
+十一、图文融合到底发生了什么
+
+每个视觉 stage 做完后，会把视觉特征从 [B, C, H, W] 展平成 token，再和文本 token 做 cross-attention。语义上就是：
+
+query = 图像 token
+key/value = 文本 token
+
+所以模型每到一层都会问一次：
+
+“当前这些视觉位置，哪些和 prompt 语义最相关？”
+
+这就是它从“普通边缘检测”变成“语义轮廓提取”的关键。
+
+CrossAttentionBlock 的内部流程可以概括为：
+
+1. 把视觉 query 和文本 key/value 都投影到公共维度 512
+2. 用 nn.MultiheadAttention 做 cross-attention
+3. 残差 + LayerNorm
+4. FFN
+5. 再残差 + LayerNorm
+6. 如果当前 stage 通道不是 512，就投影回原 stage 维度
+
+所以四个 stage 都被文本条件化了，不只是最后一层加个 prompt。
+
+十二、源码阅读主线
+
+最建议按这个顺序读：
+
+1. SegformerWithTextFusion.forward
+总入口。先看这里，能知道模型真正收什么输入：pixel_values + word_mask + local_text_feature
+
+2. SegformerMultiModel.forward
+这一层基本只是把输入传给编码器。
+
+3. SegformerMultiEncoder.forward
+这是最重要的主体。这里能看到：
+4 个视觉 stage 逐层跑
+每层后都调用一组 cross-attention
+最后返回 4 个尺度的 hidden states
+
+4. CrossAttentionBlock.forward
+这里看懂以后，就明白文本是怎么“注入”视觉特征的。
+
+5. SegformerDecodeHead.forward
+这里负责把 4 个尺度的特征统一到 768 维、上采样到同一大小、拼接融合，最后输出单通道轮廓 logits。
+
+6. process_one_image
+这里是推理闭环：
+图像预处理
+模型前向
+上采样回原图
+sigmoid 得到概率图
+
+7. nms_process_one_image
+这是后处理，把边界进一步细化。
+
+十三、各模块职责总结
+
+1. SegFormer backbone：提多尺度视觉特征
+2. text_feature.pth：提供离线编码好的 prompt token
+3. CrossAttentionBlock：把文本语义灌进每一层视觉特征
+4. DecodeHead：把多尺度特征还原成轮廓图
+5. infer.py：做推理和 NMS 后处理
+
+十四、与普通语义分割模型的区别
+
+它不是输出某类区域 mask，而是输出该语义目标的边界或轮廓。
+
+所以训练目标和推理结果都更接近 semantic contour extraction，而不是 semantic segmentation。
+
+十五、与原始 DirectSAM 思路相比的关键变化
+
+从代码落地上看，这个仓库最本质的变化有两点：
+
+1. 从“类无关边缘”变成“文本指定类别的语义轮廓”
+2. 文本信息不是只在尾部用，而是贯穿 4 个编码 stage 融合
+
+这也是它在遥感场景里更有价值的地方。
